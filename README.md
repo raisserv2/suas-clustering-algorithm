@@ -13,7 +13,70 @@ clustered — real targets converge on one point, false positives scatter and ar
 rejected as noise.
 
 **Validated result:** tent **3.80 m**, mannequin **3.94 m** on a 260 × 189 m
-synthetic search area (180-frame survey) — both well inside the 50 ft radius.
+synthetic search area (180-frame survey), rendered with SIYI A8 mini optics —
+i.e. our flight camera. Both well inside the 50 ft radius.
+
+---
+
+## Camera: SIYI A8 mini
+
+**The pipeline is camera-agnostic.** Intrinsics are passed at runtime, not
+hardcoded, which is why the same code has already run against three different
+cameras (A8 mini, GoPro HERO13, a stock 720p unit). The A8 mini is our flight
+camera and the configuration everything is validated against.
+
+### Where the A8 mini is assumed, and where it isn't
+
+| Component | A8-specific? | Notes |
+|---|---|---|
+| `src/cluster_pipeline.py` | **No** | Reads intrinsics from the flight log or CLI |
+| `src/cluster_real_yaw.py` | **No** | Takes `--hfov_deg`; pass any camera's FOV |
+| `src/inspect_dataset.py` | **No** | Reads whatever is in the EXIF |
+| `tools/viewer.html` | **No** | Renders whatever is in `results.json` |
+| Synthetic flight renderer *(separate repo)* | **Yes** | `CAMERA_CONFIG` hardcodes A8 sensor geometry; this is what the 3.80/3.94 m result was rendered with |
+
+So: nothing in **this** repo is tied to the A8. The dependency is only that our
+validation imagery was generated with A8 optics, which means the reported
+accuracy figures apply directly to A8 flights and would need re-measuring for a
+different camera.
+
+### Verified A8 mini parameters
+
+Derived from the sensor geometry (7.60 × 5.70 mm sensor, 4.51 mm focal length,
+3840 × 2160):
+
+| Quantity | Value |
+|---|---|
+| Horizontal FOV | **80.2°** |
+| Vertical FOV | 64.6° |
+| Focal length | 2278.7 px |
+| Resolution | 3840 × 2160 |
+
+Pass `--hfov_deg 80.2`. The pipeline derives focal length from FOV and image
+width, so that single flag is all the camera configuration required.
+
+> The A8 mini's "6× zoom" is **digital only** — a pixel crop with no additional
+> resolving power. Do not treat it as optical zoom, and do not enable it during
+> capture: cropping reduces the footprint without adding target detail, and
+> changes the effective FOV so `--hfov_deg 80.2` would no longer be correct.
+
+### Footprint and target size by altitude
+
+| Altitude | Ground footprint | GSD | Mannequin | Tent |
+|---|---|---|---|---|
+| 127 ft (38.7 m) | 65.2 × 48.9 m | 1.70 cm/px | 103 px | 147 px |
+| **150 ft (45.7 m)** | 77.0 × 57.8 m | 2.01 cm/px | **87 px** | **125 px** |
+| 200 ft (61.0 m) | 102.7 × 77.0 m | 2.68 cm/px | 65 px | 93 px |
+| 250 ft (76.2 m) | 128.4 × 96.3 m | 3.34 cm/px | 52 px | 75 px |
+
+The 127 ft row is the configuration the 3.80/3.94 m validation was flown at.
+At the 150 ft competition floor the mannequin is 87 px — comfortably workable,
+and far above the ~27 px at which detection failed on an earlier real flight.
+
+**Altitude is the main accuracy lever.** Detection degrades with target pixel
+size, so fly as close to the 150 ft floor as the rules and flight plan allow.
+Above ~200 ft the mannequin drops below 65 px and detection reliability falls
+off; treat that as a soft ceiling.
 
 ---
 
@@ -23,33 +86,36 @@ synthetic search area (180-frame survey) — both well inside the 50 ft radius.
 pip install -r requirements.txt
 ```
 
-Needs Python 3.9+, PyTorch, Ultralytics, scikit-learn, Pillow, numpy.
-GPU optional (auto-detected; falls back to CPU).
+Python 3.9+, PyTorch, Ultralytics, scikit-learn, Pillow, numpy.
+GPU optional (auto-detected, falls back to CPU).
 
 ---
 
 ## Quick start
 
-**1. Check the flight metadata is usable** (do this before anything else):
+**1. Check the flight metadata is usable** — do this before anything else:
 
 ```bash
 python src/inspect_dataset.py /path/to/flight_images
 ```
 
-Reports GPS, per-frame heading, altitude, camera intrinsics, and prints a
-verdict. If it says heading is missing, **stop** — see *Data requirements* below.
+Reports GPS, per-frame heading, altitude, intrinsics, and prints a verdict.
+If it says heading is missing, **stop** — see *Data requirements*.
 
-**2. Localize:**
+**2. Localize** (A8 mini at 150 ft):
 
 ```bash
 python src/cluster_real_yaw.py \
     --images_dir /path/to/flight_images \
     --model models/yolo11m_best.pt \
-    --agl_m 50 --hfov_deg 80 \
+    --agl_m 45.7 --hfov_deg 80.2 \
     --conf 0.15 --eps 4.0 --min_samples 2 \
     --classifier models/mobilenet_finetuned.pth \
     --out results.json
 ```
+
+`--agl_m` is height above **ground** in metres (150 ft = 45.7 m), not GPS
+sea-level altitude.
 
 Output:
 
@@ -60,31 +126,30 @@ Output:
   tent<->mannequin separation: 27.3 m
 ```
 
-Coordinates are given in local ENU metres and as absolute GPS. Feed the GPS to
-the drop planner.
+Feed `predicted_gps` to the drop planner.
 
-**3. Inspect what happened** — open `tools/viewer.html` in a browser and load
-`results.json`. Left pane shows detections per frame; right pane shows ground
-coordinates accumulating and clusters forming, with the 50 ft radius drawn.
+**3. Inspect** — open `tools/viewer.html` and load `results.json`. Left pane:
+detections per frame. Right pane: ground coordinates accumulating into clusters,
+with the 50 ft radius drawn.
 
 ---
 
 ## Data requirements
 
-These are hard requirements derived from a real flight that **failed** without
-them. A drone flying a circuit continuously changes heading; if heading is
-unknown, each detection's ground offset is rotated by the unmodelled yaw and a
-*fixed* target smears across the flight path instead of converging.
+Derived from a real flight that **failed** without them. A drone flying a
+circuit continuously changes heading; if heading is unknown, each detection's
+ground offset is rotated by the unmodelled yaw and a *fixed* target smears
+across the flight path instead of converging.
 
 | Requirement | Why |
 |---|---|
 | GPS per image (EXIF) | Camera position |
-| **Per-frame heading** (`GPSImgDirection`, true north) | Without it, targets do not converge — this is the known failure mode |
-| Height above **ground** (AGL), not GPS sea-level altitude | Sets projection scale; 20% AGL error = 20% position error |
+| **Per-frame heading** (`GPSImgDirection`, true north) | Without it targets do not converge — the known failure mode |
+| Height above **ground** (AGL) | Sets projection scale; 20% AGL error = 20% position error |
 | Camera locked nadir (or per-frame pitch/roll logged) | Determines whether the nadir assumption holds |
-| Rectilinear lens mode, digital zoom off | Pinhole model degrades at frame edges under barrel distortion |
-| Survey overlap giving **≥ 8 observations per target** | Fewer and no cluster forms (measured: a 48-frame pass over the same area produced none; 180 frames localized both) |
-| Ground sample distance ≤ ~2 cm/px on target | At 6.6 cm/px a mannequin is ~27 px and detection fails |
+| Digital zoom **off**, no crop modes | Changes effective FOV and invalidates `--hfov_deg` |
+| Survey overlap giving **≥ 8 observations per target** | Measured: a 48-frame pass produced no cluster; 180 frames localized both |
+| GSD ≤ ~2 cm/px on target | A8 at ≤150 ft satisfies this; at 6.6 cm/px detection failed |
 
 `inspect_dataset.py` checks the first four automatically.
 
@@ -92,20 +157,20 @@ unknown, each detection's ground offset is rotated by the unmodelled yaw and a
 
 ## Parameters
 
-| Flag | Default | Notes |
+| Flag | A8 value | Notes |
 |---|---|---|
-| `--agl_m` | required | Height above ground, metres |
-| `--hfov_deg` | 80 | Camera horizontal FOV. Focal length is derived from this |
-| `--conf` | 0.15 | Detector threshold — **deliberately low**. Clustering rejects false positives, so the detector should maximise true-positive yield. Do not raise this to "clean up" detections |
-| `--eps` | 4.0 | DBSCAN radius in metres |
-| `--min_samples` | 2 | Minimum detections per cluster. Auto-relaxes if nothing clusters |
-| `--rank` | `confsum` | **Leave this alone.** See below |
-| `--classifier` | off | Optional MobileNet gate. Effective at matched pixel scale; rejects valid targets when they are much smaller than its training crops |
+| `--agl_m` | 45.7 (at 150 ft) | Height above ground, metres |
+| `--hfov_deg` | **80.2** | A8 mini, digital zoom off |
+| `--conf` | 0.15 | **Deliberately low.** Clustering rejects false positives, so the detector should maximise true-positive yield. Do not raise this to "clean up" detections |
+| `--eps` | 4.0 | DBSCAN radius, metres |
+| `--min_samples` | 2 | Minimum per cluster; auto-relaxes if nothing clusters |
+| `--rank` | `confsum` | **Leave this alone** — see below |
+| `--classifier` | optional | MobileNet gate. Works at matched pixel scale; rejects valid targets when they are far smaller than its training crops. At A8 ≤150 ft (87+ px) it is in range and worth enabling |
 
 ### Why `--rank confsum` matters
 
-Clusters are ranked by **summed detection confidence**, not by point count. This
-is not cosmetic. On an identical flight:
+Clusters are ranked by **summed detection confidence**, not point count. On an
+identical flight:
 
 | Ranking | Mannequin error |
 |---|---|
@@ -113,15 +178,12 @@ is not cosmetic. On an identical flight:
 | `confsum` (default) | **0.68 m** |
 
 Density ranking selected a chance concentration of 41 false positives over the
-12 correct detections. Confidence weighting fixes it and does so at every
-clustering radius tested. `count` is retained only for reproducing that
-comparison.
+12 correct detections. Confidence weighting fixes it, at every clustering radius
+tested. `count` is retained only to reproduce that comparison.
 
 ---
 
 ## Integration
-
-To call from flight software rather than the CLI:
 
 ```python
 from src.cluster_real_yaw import run
@@ -129,20 +191,19 @@ import argparse
 
 args = argparse.Namespace(
     images_dir="captures/", model="models/yolo11m_best.pt",
-    agl_m=50.0, hfov_deg=80.0, conf=0.15, eps=4.0, min_samples=2,
-    rank="confsum", classifier="models/mobilenet_finetuned.pth",
-    clf_conf=0.5, out="results.json",
+    agl_m=45.7, hfov_deg=80.2,          # A8 mini @ 150 ft
+    conf=0.15, eps=4.0, min_samples=2, rank="confsum",
+    classifier="models/mobilenet_finetuned.pth", clf_conf=0.5,
+    out="results.json",
 )
 run(args)
 ```
 
-Then read `results.json`:
-
 ```python
 import json
 r = json.load(open("results.json"))
-tent_gps = r["predicted_gps"]["tent"]        # {"lat": ..., "lon": ...}
-mann_gps = r["predicted_gps"]["mannequin"]
+tent_gps = r["predicted_gps"].get("tent")        # {"lat":..., "lon":...} or None
+mann_gps = r["predicted_gps"].get("mannequin")
 ```
 
 A class missing from `predicted_gps` means no cluster formed — treat as "target
@@ -163,32 +224,30 @@ per_frame[]      image, gps, heading_deg, cam_xyz_m, detections[]
 ## Jetson / deployment notes
 
 - **TensorRT engines are GPU-specific.** An engine built on a laptop will not
-  load on the Orin Nano. Export on the target device.
-- **Export accuracy vs. latency separately.** Accuracy degradation from
-  quantization can be measured anywhere (ONNX/OpenVINO on any machine) and the
-  conclusion transfers; latency must be measured on the Jetson.
+  load on the Orin Nano — export on the target device.
+- **Measure accuracy and latency separately.** Quantization accuracy loss can be
+  measured anywhere (ONNX/OpenVINO) and the conclusion transfers; latency must
+  be measured on the Jetson.
 - `tools/benchmark_quantization.py` runs the full pipeline once per model
-  variant against the same imagery and reports localization error, detection
+  variant against identical imagery, reporting localization error, detection
   yield, confidence shift, and ms/frame.
-- **Watch the ranking margin**, which the benchmark reports. Because ranking is
-  confidence-weighted, INT8 quantization can compress the confidence
-  distribution and erode the gap between the true cluster and the runner-up.
-  A passing error with a <20% margin is fragile. Standard mAP will not show
-  this.
-- If INT8 degrades the mannequin, fall back to FP16 — most of the speedup, far
-  less accuracy risk.
+- **Watch the ranking margin** the benchmark reports. Because ranking is
+  confidence-weighted, INT8 can compress the confidence distribution and erode
+  the gap between the true cluster and the runner-up. A passing error with a
+  <20% margin is fragile — standard mAP will not reveal this.
+- If INT8 degrades the mannequin, fall back to FP16.
 
 ---
 
 ## Files
 
 ```
-src/cluster_pipeline.py    clustering core, back-projection, classifier gate
-src/cluster_real_yaw.py    real-flight entry point (EXIF GPS + heading)  <- run this
-src/inspect_dataset.py     metadata validator — run before any new flight
-tools/viewer.html          replay UI, loads results.json, no GPU needed
+src/cluster_pipeline.py           clustering core, back-projection, classifier gate
+src/cluster_real_yaw.py           real-flight entry point (EXIF GPS + heading)  <- run this
+src/inspect_dataset.py            metadata validator — run before any new flight
+tools/viewer.html                 replay UI, loads results.json, no GPU needed
 tools/benchmark_quantization.py   quantized-variant comparison
-models/                    detector + verification classifier weights
+models/                           detector + verification classifier weights
 ```
 
 `cluster_real_yaw.py` imports from `cluster_pipeline.py` as a sibling — keep
@@ -198,11 +257,16 @@ them in the same directory.
 
 ## Known limitations
 
-- Assumes a **flat ground plane** at the targets' elevation. Significant terrain
-  relief introduces proportional position error.
-- Assumes a **pinhole camera**. Strong barrel distortion degrades accuracy for
-  detections near frame edges.
-- The verification classifier is **scale-sensitive** — it rejects valid targets
-  rendered much smaller than its training crops. Disable it rather than fight it
-  if target pixel size is low; the geometric false-positive rejection works
-  without it.
+- Assumes a **flat ground plane** at target elevation; terrain relief introduces
+  proportional position error.
+- Assumes a **pinhole camera**; lens distortion degrades accuracy for detections
+  near frame edges.
+- The verification classifier is **scale-sensitive**. It rejects valid targets
+  much smaller than its training crops — a problem at high altitude or low
+  resolution, not at A8 ≤150 ft. Disable it rather than fight it if target pixel
+  size is low; geometric false-positive rejection works without it.
+- **No optical zoom.** A two-stage search-then-verify concept using an optical
+  zoom payload was evaluated but is not available; the pipeline runs
+  single-stage, so clustering carries the full false-positive burden. This
+  raises the value of survey overlap (more observations → larger ranking margin)
+  and of the classifier gate at A8 pixel scales.

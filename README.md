@@ -18,6 +18,161 @@ i.e. our flight camera. Both well inside the 50 ft radius.
 
 ---
 
+## How it works
+
+### Pipeline
+
+```
+   flight images (+ EXIF GPS, heading, AGL)
+        │
+        ▼
+   ┌─────────────┐   per frame, in capture order
+   │  1 DETECT   │   YOLO at low confidence (0.15)
+   └─────────────┘   → boxes + class + confidence
+        │
+        ▼
+   ┌─────────────┐   optional (--classifier)
+   │ 2 CLF GATE  │   MobileNetV3 re-checks each crop
+   └─────────────┘   → drop anything classed "background"
+        │
+        ▼
+   ┌─────────────┐   box centre pixel → ground coordinate
+   │ 3 GEOLOCATE │   using camera pose + intrinsics + AGL
+   └─────────────┘   → (East, North) metres
+        │
+        ▼            accumulate across ALL frames
+   ┌─────────────┐   DBSCAN per class
+   │  4 CLUSTER  │   → clusters + noise
+   └─────────────┘
+        │
+        ▼
+   ┌─────────────┐   score = Σ member confidences
+   │   5 RANK    │   → best cluster per class
+   └─────────────┘
+        │
+        ▼
+   one (lat, lon) per class  →  drop planner
+```
+
+Stages 1–3 run per frame; stages 4–5 run once at the end over everything
+accumulated. The classifier gate sits **before** geolocation deliberately, so
+rejected detections never enter the point cloud at all.
+
+### 1. Detection — deliberately permissive
+
+The detector runs at `--conf 0.15`, much lower than typical. This is
+intentional and worth understanding before anyone "fixes" it: false-positive
+rejection happens geometrically in stage 4, so the detector's job here is to
+maximise *true-positive yield* feeding the cluster, not to be selective.
+Raising the threshold starves the cluster of the points it needs.
+
+### 2. Classifier gate — optional
+
+Each detection crop is re-classified by a MobileNetV3-Large head
+(tent / mannequin / background). Anything classed background, or below
+`--clf_conf`, is discarded. When the classifier fires confidently it also
+overrides the detector's class label.
+
+This stage is **scale-sensitive**: it works when the target occupies a similar
+pixel scale to its training crops, and rejects valid targets when they are far
+smaller. At A8 ≤150 ft (87+ px) it is in range. It is optional because the
+primary false-positive defence is geometric and works without it.
+
+### 3. Geolocation — ray-cast to ground plane
+
+Each detection's box-centre pixel is converted to a ground coordinate:
+
+1. Build a ray in camera space from the pixel offset and the focal length
+   (derived from `--hfov_deg` and image width).
+2. Rotate that ray into world space using the camera's orientation — for real
+   flights, the nadir mounting plus the per-frame `GPSImgDirection` heading.
+3. Intersect it with the ground plane at target elevation.
+4. Offset by the camera's own position (GPS → local ENU metres).
+
+This is exact for **arbitrary yaw, pitch and roll**, not just nadir. Verified
+numerically:
+
+| Check | Result |
+|---|---|
+| Forward-project a known point → pixel → back-project | ≤ 1.1 × 10⁻¹⁴ m |
+| Ray-cast vs. closed-form nadir formula, nadir camera | 5.0 × 10⁻¹⁵ m |
+| Known target under yaw 0–270°, pitch 0–25°, roll ±8° | ≤ 4.0 × 10⁻¹⁵ m |
+| Fixed target from 5 different positions **and** headings | converge, spread ≤ 1.5 × 10⁻¹⁴ m |
+
+Those are floating-point zero. **The geolocation stage is exact**, so any field
+error is attributable to pose measurement or detection — never to the
+projection. That separation is what made debugging tractable.
+
+The last row is the property the whole method rests on: the same physical
+target, seen from anywhere at any heading, lands on the same ground coordinate.
+
+### 4. Clustering — DBSCAN
+
+Ground coordinates are accumulated per class across the entire flight, then
+clustered with DBSCAN (`--eps` metres, `--min_samples` points).
+
+DBSCAN is chosen over k-means for two specific reasons:
+
+- It does not require the number of clusters up front. We do not know how many
+  distinct things the detector fired on.
+- It labels low-density points as **noise**. Scattered false positives are
+  therefore rejected by the algorithm's own behaviour rather than by a
+  hand-tuned filter. This *is* the false-positive rejection mechanism.
+
+A real target, detected across many frames, produces a tight knot of points at
+one coordinate. A false positive on some ground feature appears in one frame and
+projects somewhere unrelated in the next, so it never accumulates density.
+
+### 5. Ranking — confidence-weighted, not densest
+
+Each surviving cluster is scored as the **sum of its members' detection
+confidences**, and the winning cluster's centroid is a confidence-weighted mean.
+The highest-scoring cluster per class is emitted as that target's location.
+
+The obvious alternative — pick the cluster with the most points — fails. On an
+identical flight:
+
+| Ranking | Mannequin error |
+|---|---|
+| `count` (densest cluster) | **73.60 m** — miss |
+| `confsum` (default) | **0.68 m** |
+
+Diagnosis of that failure: of 53 mannequin points, 12 lay within 50 ft of truth
+and the closest was 0.6 m — the detector had found it. But among the 41 false
+positives was a chance concentration containing *more points* than the true
+cluster. The detection was right; the ranking picked the wrong cluster.
+
+Real detections and ground false positives differ systematically in confidence
+even when they do not differ in count, so scoring by summed confidence lets
+quality outvote quantity. Sweeps confirm it selects correctly at **every**
+`--eps` tested (1.0, 1.5, 2.0 m), whereas density ranking only recovers the
+right answer at the tightest setting — so this is robust, not tuned.
+
+### Robustness: sparse-target relaxation
+
+A target detected in only 2–3 frames can form a perfectly tight, accurate
+cluster that DBSCAN discards for falling below `min_samples` — a correct answer
+thrown away on a technicality.
+
+If no cluster forms for a class while points exist, clustering is retried with
+`min_samples = 1`. The winner must then pass a viability test (≥ 2 member points,
+or a single detection above a confidence floor). This recovered a three-point
+tent cluster to 0.42 m in testing, without admitting isolated low-confidence
+false positives.
+
+### Two entry points
+
+| Script | Use for | Pose source |
+|---|---|---|
+| `src/cluster_real_yaw.py` | **real flights** | EXIF GPS + `GPSImgDirection` heading + `--agl_m` |
+| `src/cluster_pipeline.py synthetic` | pre-rendered synthetic flights | `flight_log.jsonl` camera poses; reports error against known ground truth |
+
+Both share the same stages 1–5; only the pose source differs. The synthetic mode
+is what produced the 3.80 / 3.94 m validation figures, since it has ground truth
+to measure against.
+
+---
+
 ## Camera: SIYI A8 mini
 
 **The pipeline is camera-agnostic.** Intrinsics are passed at runtime, not

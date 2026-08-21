@@ -1,0 +1,406 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Flight Cluster Replay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#0b0f12; --panel:#11171c; --line:#1f2a31; --line2:#2c3a44;
+    --ink:#e7eef2; --dim:#7e909b; --faint:#4a5a64;
+    --tent:#34d399;          /* tent = green */
+    --mann:#f59e0b;          /* mannequin = amber */
+    --tent-soft:rgba(52,211,153,.16);
+    --mann-soft:rgba(245,158,11,.16);
+    --truth:#e7eef2; --hit:#34d399; --miss:#ef4444;
+    --mono:"SF Mono",ui-monospace,"Cascadia Mono","Roboto Mono",Menlo,Consolas,monospace;
+    --sans:"Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);
+       font-size:14px;line-height:1.4;-webkit-font-smoothing:antialiased}
+  .wrap{display:flex;flex-direction:column;height:100vh}
+
+  header{display:flex;align-items:baseline;gap:18px;padding:14px 20px;
+         border-bottom:1px solid var(--line);flex:0 0 auto}
+  header h1{font-size:13px;font-weight:600;letter-spacing:.14em;
+            text-transform:uppercase;margin:0}
+  header .sub{font-family:var(--mono);font-size:11px;color:var(--dim);
+              letter-spacing:.04em}
+  header .spacer{flex:1}
+  .load{font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .load input{display:none}
+  .load label{cursor:pointer;color:var(--ink);border:1px solid var(--line2);
+              padding:5px 11px;border-radius:2px;transition:border-color .15s}
+  .load label:hover{border-color:var(--mann)}
+
+  main{flex:1;display:grid;grid-template-columns:1fr 1fr;min-height:0}
+  .pane{position:relative;min-height:0;display:flex;flex-direction:column;
+        border-right:1px solid var(--line)}
+  .pane:last-child{border-right:0}
+  .pane .cap{position:absolute;top:10px;left:12px;z-index:5;
+             font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+             text-transform:uppercase;color:var(--dim);
+             background:rgba(11,15,18,.6);padding:3px 7px;border-radius:2px}
+  .stage{flex:1;min-height:0;position:relative}
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+
+  /* footer / transport */
+  footer{flex:0 0 auto;border-top:1px solid var(--line);
+          padding:12px 20px 16px;display:flex;flex-direction:column;gap:10px}
+  .transport{display:flex;align-items:center;gap:14px}
+  button.play{font-family:var(--mono);font-size:12px;letter-spacing:.08em;
+        background:var(--mann);color:#15110a;border:0;border-radius:2px;
+        padding:8px 18px;cursor:pointer;font-weight:600;min-width:84px}
+  button.play.playing{background:var(--tent);color:#06140d}
+  .scrub{flex:1;display:flex;align-items:center;gap:12px}
+  input[type=range]{flex:1;accent-color:var(--mann);height:3px}
+  .frameno{font-family:var(--mono);font-size:12px;color:var(--ink);
+           min-width:120px;text-align:right}
+  .speed{font-family:var(--mono);font-size:11px;color:var(--dim);
+         display:flex;align-items:center;gap:6px}
+  .speed select{background:var(--panel);color:var(--ink);border:1px solid var(--line2);
+                font-family:var(--mono);font-size:11px;padding:3px 5px;border-radius:2px}
+
+  /* readout strip */
+  .readout{display:flex;gap:0;border:1px solid var(--line);border-radius:3px;
+           overflow:hidden;font-family:var(--mono)}
+  .stat{flex:1;padding:9px 14px;border-right:1px solid var(--line)}
+  .stat:last-child{border-right:0}
+  .stat .k{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+  .stat .v{font-size:15px;margin-top:3px;color:var(--ink)}
+  .stat .v.tent{color:var(--tent)} .stat .v.mann{color:var(--mann)}
+  .stat .v.hit{color:var(--hit)} .stat .v.miss{color:var(--miss)}
+  .stat .v small{font-size:11px;color:var(--dim)}
+
+  .legend{display:flex;gap:18px;font-family:var(--mono);font-size:10px;
+          color:var(--dim);letter-spacing:.04em;flex-wrap:wrap}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .dot.t{background:var(--tent)} .dot.m{background:var(--mann)}
+  .dot.x{width:10px;height:10px;border-radius:0;transform:rotate(45deg);
+         background:transparent;border:1.5px solid var(--truth)}
+  .dot.ring{background:transparent;border:1.5px solid var(--faint)}
+
+  .empty{position:absolute;inset:0;display:flex;align-items:center;
+          justify-content:center;color:var(--faint);font-family:var(--mono);
+          font-size:12px;text-align:center;padding:30px;letter-spacing:.04em}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Flight&nbsp;Cluster&nbsp;Replay</h1>
+    <span class="sub" id="modeTag">no data</span>
+    <span class="spacer"></span>
+    <span class="load">
+      <label for="file">Load results.json</label>
+      <input id="file" type="file" accept=".json,application/json">
+    </span>
+  </header>
+
+  <main>
+    <section class="pane">
+      <span class="cap">Camera&nbsp;·&nbsp;detections</span>
+      <div class="stage">
+        <canvas id="camCanvas"></canvas>
+        <div class="empty" id="camEmpty">Load a results.json produced by<br>cluster_pipeline.py to begin.</div>
+      </div>
+    </section>
+    <section class="pane">
+      <span class="cap">Ground&nbsp;·&nbsp;accumulating&nbsp;clusters</span>
+      <div class="stage">
+        <canvas id="mapCanvas"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="readout">
+      <div class="stat"><div class="k">Frame</div><div class="v" id="rFrame">—</div></div>
+      <div class="stat"><div class="k">Tent points</div><div class="v tent" id="rTentPts">—</div></div>
+      <div class="stat"><div class="k">Mannequin points</div><div class="v mann" id="rMannPts">—</div></div>
+      <div class="stat"><div class="k">Tent error</div><div class="v" id="rTentErr">—</div></div>
+      <div class="stat"><div class="k">Mannequin error</div><div class="v" id="rMannErr">—</div></div>
+    </div>
+
+    <div class="transport">
+      <button class="play" id="playBtn">PLAY</button>
+      <div class="scrub">
+        <input type="range" id="scrub" min="0" max="0" value="0" step="1">
+        <span class="frameno" id="frameNo">0 / 0</span>
+      </div>
+      <div class="speed">
+        rate
+        <select id="speed">
+          <option value="500">slow</option>
+          <option value="200" selected>1×</option>
+          <option value="90">fast</option>
+          <option value="30">max</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="legend">
+      <span><i class="dot t"></i> tent detection</span>
+      <span><i class="dot m"></i> mannequin detection</span>
+      <span><i class="dot x"></i> ground truth</span>
+      <span><i class="dot ring"></i> predicted centroid (densest cluster)</span>
+      <span id="legNote"></span>
+    </div>
+  </footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let DATA=null, FRAMES=[], cur=0, playing=false, timer=null;
+let bounds=null;            // {minx,maxx,miny,maxy} ground extent for map
+const imgCache = new Map(); // image path -> Image (synthetic only, if reachable)
+
+const camCanvas=$("camCanvas"), mapCanvas=$("mapCanvas");
+const cctx=camCanvas.getContext("2d"), mctx=mapCanvas.getContext("2d");
+
+function fitCanvas(c){
+  const r=c.getBoundingClientRect(), d=window.devicePixelRatio||1;
+  c.width=Math.max(1,Math.round(r.width*d));
+  c.height=Math.max(1,Math.round(r.height*d));
+  const ctx=c.getContext("2d"); ctx.setTransform(d,0,0,d,0,0);
+  return {w:r.width,h:r.height};
+}
+
+$("file").addEventListener("change",e=>{
+  const f=e.target.files[0]; if(!f)return;
+  const rd=new FileReader();
+  rd.onload=()=>{ try{ load(JSON.parse(rd.result)); }
+    catch(err){ alert("Could not parse JSON: "+err.message); } };
+  rd.readAsText(f);
+});
+
+function load(d){
+  DATA=d; FRAMES=d.per_frame||[]; cur=0;
+  $("camEmpty").style.display="none";
+  $("modeTag").textContent =
+    (d.mode==="synthetic"?"synthetic flight":"real GoPro · Tier-1 GPS")
+    + " · " + FRAMES.length + " frames";
+  computeBounds();
+  $("scrub").max=Math.max(0,FRAMES.length-1);
+  $("scrub").value=0;
+  // error readouts are static (computed over the whole flight)
+  const e=d.errors||{};
+  setErr("rTentErr", e.tent, "tent");
+  setErr("rMannErr", e.mannequin, "mann");
+  $("legNote").textContent = d.coord_system ? ("units: "+d.coord_system) : "";
+  draw();
+}
+
+function setErr(elId, e, cls){
+  const el=$(elId);
+  if(!e){ el.textContent="—"; el.className="v"; return; }
+  el.innerHTML = e.error_m.toFixed(2)+" m <small>/ "+e.error_ft.toFixed(0)+" ft</small>";
+  el.className = "v "+(e.within_50ft?"hit":"miss");
+}
+
+// ground extent: union of all detection points + ground-truth + a margin
+function computeBounds(){
+  let xs=[], ys=[];
+  const cl=DATA.clusters||{};
+  for(const t of ["tent","mannequin"]){
+    (cl[t]?.points||[]).forEach(p=>{xs.push(p[0]);ys.push(p[1]);});
+  }
+  const gt=DATA.ground_truth?.ground_truth_world_xy;
+  if(gt){ for(const t in gt){ xs.push(gt[t].x); ys.push(gt[t].y);} }
+  // also include camera path so the swept area frames nicely
+  FRAMES.forEach(f=>{ const c=f.cam_xyz_m||f.local_xy_m;
+    if(c){ xs.push(c[0]); ys.push(c[1]); }});
+  if(xs.length===0){ bounds={minx:-30,maxx:30,miny:-20,maxy:20}; return; }
+  let minx=Math.min(...xs),maxx=Math.max(...xs),
+      miny=Math.min(...ys),maxy=Math.max(...ys);
+  const padx=Math.max(3,(maxx-minx)*0.12), pady=Math.max(3,(maxy-miny)*0.12);
+  bounds={minx:minx-padx,maxx:maxx+padx,miny:miny-pady,maxy:maxy+pady};
+}
+
+// map ground (x,y) -> canvas px, preserving aspect, y-up
+function mapXform(w,h){
+  const bw=bounds.maxx-bounds.minx, bh=bounds.maxy-bounds.miny;
+  const s=Math.min(w/bw, h/bh)*0.92;
+  const ox=(w-bw*s)/2, oy=(h-bh*s)/2;
+  return {
+    x: gx => ox + (gx-bounds.minx)*s,
+    y: gy => h - (oy + (gy-bounds.miny)*s),   // flip: world +y up
+    s
+  };
+}
+
+/* ---------- LEFT: camera frame + boxes ---------- */
+function drawCam(){
+  const {w,h}=fitCanvas(camCanvas);
+  cctx.clearRect(0,0,w,h);
+  if(!FRAMES.length) return;
+  const fr=FRAMES[cur];
+  const intr = (DATA.ground_truth&&DATA.ground_truth.intrinsics) ||
+               (fr.intrinsics) || {image_width_px:3840,image_height_px:2160};
+  const IW=intr.image_width_px, IH=intr.image_height_px;
+  // letterbox the image area to the frame's aspect
+  const ar=IW/IH; let dw=w,dh=w/ar; if(dh>h){dh=h;dw=h*ar;}
+  const dx=(w-dw)/2, dy=(h-dh)/2;
+
+  // try to show the actual rendered frame if the browser can reach it
+  const img = tryImage(fr.image);
+  if(img && img.complete && img.naturalWidth){
+    cctx.drawImage(img,dx,dy,dw,dh);
+  }else{
+    // schematic frame backdrop
+    cctx.fillStyle="#0d1318"; cctx.fillRect(dx,dy,dw,dh);
+    cctx.strokeStyle="#1f2a31"; cctx.lineWidth=1; cctx.strokeRect(dx+.5,dy+.5,dw-1,dh-1);
+    // crosshair = image centre (nadir nadir point)
+    cctx.strokeStyle="#16212840"; 
+    cctx.beginPath();cctx.moveTo(dx+dw/2,dy);cctx.lineTo(dx+dw/2,dy+dh);
+    cctx.moveTo(dx,dy+dh/2);cctx.lineTo(dx+dw,dy+dh/2);cctx.stroke();
+  }
+  const sx=dw/IW, sy=dh/IH;
+  (fr.detections||[]).forEach(d=>{
+    const isT = matchCls(d.cls_name,"tent");
+    const isM = matchCls(d.cls_name,"mannequin");
+    const col = isT?getCss("--tent"):isM?getCss("--mann"):getCss("--faint");
+    const [x0,y0,x1,y1]=d.box_xyxy;
+    const rx=dx+x0*sx, ry=dy+y0*sy, rw=(x1-x0)*sx, rh=(y1-y0)*sy;
+    cctx.lineWidth=2; cctx.strokeStyle=col; cctx.strokeRect(rx,ry,rw,rh);
+    const tag=`${d.cls_name} ${(d.conf*100|0)}%`;
+    cctx.font="11px "+getCss("--mono");
+    const tw=cctx.measureText(tag).width+8;
+    cctx.fillStyle=col; cctx.fillRect(rx,ry-15,tw,15);
+    cctx.fillStyle="#08110c"; cctx.fillText(tag,rx+4,ry-4);
+  });
+}
+
+function tryImage(path){
+  if(!path) return null;
+  if(imgCache.has(path)) return imgCache.get(path);
+  const im=new Image();
+  // results.json stores relative path like images/frame_0000.jpg.
+  // works if the html is opened from the flight_dir; otherwise silently
+  // falls back to the schematic view.
+  im.src=path;
+  im.onload=()=>draw(); im.onerror=()=>{};
+  imgCache.set(path,im);
+  return im;
+}
+
+/* ---------- RIGHT: ground map, accumulating ---------- */
+function drawMap(){
+  const {w,h}=fitCanvas(mapCanvas);
+  mctx.clearRect(0,0,w,h);
+  if(!FRAMES.length||!bounds) return;
+  const T=mapXform(w,h);
+
+  // grid (10 m)
+  mctx.strokeStyle="#16212880"; mctx.lineWidth=1; mctx.font="9px "+getCss("--mono");
+  mctx.fillStyle="#3a4750";
+  const step=10;
+  for(let gx=Math.ceil(bounds.minx/step)*step;gx<=bounds.maxx;gx+=step){
+    const X=T.x(gx); mctx.beginPath();mctx.moveTo(X,0);mctx.lineTo(X,h);mctx.stroke();
+  }
+  for(let gy=Math.ceil(bounds.miny/step)*step;gy<=bounds.maxy;gy+=step){
+    const Y=T.y(gy); mctx.beginPath();mctx.moveTo(0,Y);mctx.lineTo(w,Y);mctx.stroke();
+  }
+
+  // flown path up to current frame
+  mctx.strokeStyle="#243038";
+  mctx.lineWidth=1.5; mctx.beginPath();
+  let started=false;
+  for(let i=0;i<=cur&&i<FRAMES.length;i++){
+    const c=FRAMES[i].cam_xyz_m||FRAMES[i].local_xy_m; if(!c)continue;
+    const X=T.x(c[0]),Y=T.y(c[1]);
+    if(!started){mctx.moveTo(X,Y);started=true;}else mctx.lineTo(X,Y);
+  }
+  mctx.stroke();
+  // current camera position
+  const cc=FRAMES[cur].cam_xyz_m||FRAMES[cur].local_xy_m;
+  if(cc){
+    mctx.fillStyle="#cdd8de";
+    mctx.beginPath();mctx.arc(T.x(cc[0]),T.y(cc[1]),3.5,0,7);mctx.fill();
+  }
+
+  // accumulated detection points up to current frame, per class
+  const cl=DATA.clusters||{};
+  for(const t of ["tent","mannequin"]){
+    const pts=cl[t]?.points||[], meta=cl[t]?.point_meta||[];
+    const col = t==="tent"?getCss("--tent"):getCss("--mann");
+    for(let i=0;i<pts.length;i++){
+      if(meta[i] && meta[i].frame>cur) continue;   // not yet "flown"
+      const X=T.x(pts[i][0]),Y=T.y(pts[i][1]);
+      mctx.fillStyle=col; mctx.globalAlpha=0.5;
+      mctx.beginPath();mctx.arc(X,Y,3,0,7);mctx.fill();
+    }
+    mctx.globalAlpha=1;
+  }
+
+  // predicted centroids (only meaningful once flight is complete; we show
+  // them always so you can watch the truth/prediction relationship)
+  const preds=DATA.predictions||{};
+  for(const t of ["tent","mannequin"]){
+    if(!preds[t])continue;
+    const col=t==="tent"?getCss("--tent"):getCss("--mann");
+    const X=T.x(preds[t][0]),Y=T.y(preds[t][1]);
+    mctx.strokeStyle=col;mctx.lineWidth=2;
+    mctx.beginPath();mctx.arc(X,Y,11,0,7);mctx.stroke();
+    // 50ft radius ring around centroid (50ft = 15.24 m), scaled
+    mctx.globalAlpha=0.35;mctx.setLineDash([4,4]);
+    mctx.beginPath();mctx.arc(X,Y,15.24*T.s,0,7);mctx.stroke();
+    mctx.setLineDash([]);mctx.globalAlpha=1;
+  }
+
+  // ground truth markers (diamonds)
+  const gt=DATA.ground_truth?.ground_truth_world_xy;
+  if(gt){
+    for(const t in gt){
+      const X=T.x(gt[t].x),Y=T.y(gt[t].y);
+      mctx.strokeStyle=getCss("--truth");mctx.lineWidth=2;
+      mctx.save();mctx.translate(X,Y);mctx.rotate(Math.PI/4);
+      mctx.strokeRect(-6,-6,12,12);mctx.restore();
+    }
+  }
+}
+
+function matchCls(name,target){
+  name=(name||"").toLowerCase();
+  if(target==="tent")return name.includes("tent");
+  if(target==="mannequin")return ["mannequin","person","human","dummy"].some(k=>name.includes(k));
+  return false;
+}
+function getCss(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+
+/* ---------- transport ---------- */
+function draw(){
+  drawCam(); drawMap();
+  if(!FRAMES.length)return;
+  const fr=FRAMES[cur];
+  $("frameNo").textContent=`${cur+1} / ${FRAMES.length}`;
+  $("rFrame").textContent=fr.image? fr.image.split("/").pop() : (cur+1);
+  // running point counts up to current frame
+  const cl=DATA.clusters||{};
+  for(const [t,el] of [["tent","rTentPts"],["mannequin","rMannPts"]]){
+    const meta=cl[t]?.point_meta||[];
+    const n=meta.filter(m=>m.frame<=cur).length;
+    const total=meta.length;
+    $(el).textContent = total? `${n} / ${total}` : "0";
+  }
+  $("scrub").value=cur;
+}
+function step(){ if(cur<FRAMES.length-1){cur++;draw();} else stop(); }
+function play(){ if(!FRAMES.length)return; playing=true; $("playBtn").textContent="PAUSE";
+  $("playBtn").classList.add("playing");
+  const ms=+$("speed").value;
+  clearInterval(timer); timer=setInterval(step,ms);
+}
+function stop(){ playing=false; $("playBtn").textContent="PLAY";
+  $("playBtn").classList.remove("playing"); clearInterval(timer); }
+$("playBtn").onclick=()=>{ if(playing)stop(); else { if(cur>=FRAMES.length-1)cur=0; play(); } };
+$("scrub").oninput=e=>{ cur=+e.target.value; if(playing)stop(); draw(); };
+$("speed").onchange=()=>{ if(playing)play(); };
+window.addEventListener("resize",draw);
+window.addEventListener("keydown",e=>{
+  if(e.key===" "){e.preventDefault();$("playBtn").click();}
+  if(e.key==="ArrowRight"&&cur<FRAMES.length-1){cur++;draw();}
+  if(e.key==="ArrowLeft"&&cur>0){cur--;draw();}
+});
+draw();
+</script>

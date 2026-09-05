@@ -84,24 +84,43 @@ Each detection's box-centre pixel is converted to a ground coordinate:
 
 1. Build a ray in camera space from the pixel offset and the focal length
    (derived from `--hfov_deg` and image width).
-2. Rotate that ray into world space using the camera's orientation — for real
-   flights, the nadir mounting plus the per-frame `GPSImgDirection` heading.
+2. Rotate that ray into world space using the camera's orientation — nadir
+   pitch and zero roll, held fixed by the gimbal, plus the per-frame heading
+   (`GPSImgDirection` for real flights).
 3. Intersect it with the ground plane at target elevation.
 4. Offset by the camera's own position (GPS → local ENU metres).
 
-This is exact for **arbitrary yaw, pitch and roll**, not just nadir. Verified
-numerically:
+**Gimbal model: yaw follows the drone, pitch and roll don't.** A gimbal holds
+the camera level and pointing straight down regardless of the drone body's
+attitude — only yaw (heading) tracks the drone. `backproject_raycast` (used
+for synthetic flights, which supply a full drone pose matrix) reflects this:
+it extracts just the yaw from that pose and rebuilds a nadir, zero-roll
+orientation from it, rather than trusting whatever pitch/roll the drone body
+happened to have in a given frame. `backproject_yaw_nadir` (used for real
+flights, which supply an explicit `GPSImgDirection` heading instead of a full
+pose matrix) already worked this way. The two are numerically identical for
+the same yaw — confirmed by direct comparison across a range of headings, and
+confirmed that injecting an artificial drone pitch into the pose matrix no
+longer perturbs `backproject_raycast`'s output at all.
+
+Verified numerically:
 
 | Check | Result |
 |---|---|
 | Forward-project a known point → pixel → back-project | ≤ 1.1 × 10⁻¹⁴ m |
 | Ray-cast vs. closed-form nadir formula, nadir camera | 5.0 × 10⁻¹⁵ m |
-| Known target under yaw 0–270°, pitch 0–25°, roll ±8° | ≤ 4.0 × 10⁻¹⁵ m |
 | Fixed target from 5 different positions **and** headings | converge, spread ≤ 1.5 × 10⁻¹⁴ m |
 
 Those are floating-point zero. **The geolocation stage is exact**, so any field
 error is attributable to pose measurement or detection — never to the
 projection. That separation is what made debugging tractable.
+
+> The earlier version of this pipeline let a drone-body pitch/roll baked into
+> the synthetic pose matrix rotate the ray along with yaw, and had a
+> validation row ("known target under yaw 0–270°, pitch 0–25°, roll ±8°")
+> exercising that. That row described a mode that no longer exists — pitch
+> and roll are now fixed by the gimbal model above — so it's been removed
+> rather than left describing behavior the code no longer has.
 
 The last row is the property the whole method rests on: the same physical
 target, seen from anywhere at any heading, lands on the same ground coordinate.
@@ -301,7 +320,7 @@ across the flight path instead of converging.
 | GPS per image (EXIF) | Camera position |
 | **Per-frame heading** (`GPSImgDirection`, true north) | Without it targets do not converge — the known failure mode |
 | Height above **ground** (AGL) | Sets projection scale; 20% AGL error = 20% position error |
-| Camera locked nadir (or per-frame pitch/roll logged) | Determines whether the nadir assumption holds |
+| Camera gimbal-locked nadir, level roll | The pipeline assumes pitch/roll are held constant by the gimbal and only yaw tracks the drone — it does not model a drone body that pitches/rolls the camera with it |
 | Digital zoom **off**, no crop modes | Changes effective FOV and invalidates `--hfov_deg` |
 | Survey overlap giving **≥ 8 observations per target** | Measured: a 48-frame pass produced no cluster; 180 frames localized both |
 | GSD ≤ ~2 cm/px on target | A8 at ≤150 ft satisfies this; at 6.6 cm/px detection failed |
@@ -416,6 +435,11 @@ them in the same directory.
   proportional position error.
 - Assumes a **pinhole camera**; lens distortion degrades accuracy for detections
   near frame edges.
+- Assumes the camera is **gimbal-stabilized to nadir with level roll**, and
+  models only yaw as tracking the drone. A gimbal that doesn't fully null out
+  the drone's pitch/roll (or a fixed, non-nadir camera mount) will bias every
+  detection's ground offset — the pipeline has no way to detect this from the
+  data alone.
 - The verification classifier is **scale-sensitive**. It rejects valid targets
   much smaller than its training crops — a problem at high altitude or low
   resolution, not at A8 ≤150 ft. Disable it rather than fight it if target pixel

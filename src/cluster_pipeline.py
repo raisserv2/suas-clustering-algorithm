@@ -200,12 +200,20 @@ def backproject_nadir(cx_px, cy_px, cam_xyz, intr):
 
 
 def backproject_raycast(cx_px, cy_px, cam_matrix_world, intr):
-    """GENERAL reprojection for ANY camera orientation (yaw/pitch/roll).
+    """GIMBAL-LOCKED reprojection: yaw follows the drone, pitch/roll don't.
 
     Casts a ray from the camera centre through the detection pixel and
-    intersects the ground plane z=0. Works for tilted/rotated cameras where the
-    nadir formula fails. On a nadir camera it reproduces backproject_nadir
-    exactly (verified to ~1e-15 m).
+    intersects the ground plane z=0. On a nadir camera it reproduces
+    backproject_nadir exactly (verified to ~1e-15 m).
+
+    A real gimbal holds the camera level and pointing straight down
+    regardless of the drone body's attitude -- only yaw (heading) tracks the
+    drone. So rather than trusting whatever pitch/roll happens to be baked
+    into the drone's pose matrix, we extract just the yaw from it and rebuild
+    a nadir, zero-roll camera orientation from that yaw alone. This matches
+    the model used for real flights in cluster_real_yaw.py's
+    backproject_yaw_nadir(), just expressed as a rotation matrix instead of
+    an explicit heading angle.
 
     cam_matrix_world : 4x4 Blender camera pose. Blender camera looks down its
     local -Z axis with +X right, +Y up. Returns (X, Y) ground coords, or None
@@ -213,7 +221,23 @@ def backproject_raycast(cx_px, cy_px, cam_matrix_world, intr):
     """
     M = np.asarray(cam_matrix_world, dtype=float)
     cam_pos = M[:3, 3]
-    R = M[:3, :3]
+    R_drone = M[:3, :3]
+
+    # Recover yaw only, discarding drone pitch/roll: the camera's local +Y
+    # ("up", image top) axis in world space still carries the yaw even under
+    # drone pitch/roll, so its horizontal-plane projection gives the heading
+    # the gimbal is pointed at.
+    up_world = R_drone @ np.array([0.0, 1.0, 0.0])
+    yaw = math.atan2(up_world[0], up_world[1])
+    # Rebuild a nadir (local -Z looks straight down), zero-roll rotation from
+    # yaw alone. Columns are where camera-local X/Y/Z (right/up/look-up) land
+    # in world space; this is the fixed-pitch, yaw-only gimbal model.
+    R = np.array([
+        [math.cos(yaw), math.sin(yaw), 0.0],
+        [-math.sin(yaw), math.cos(yaw), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+
     W = intr["image_width_px"]; H = intr["image_height_px"]
     fmm = intr["focal_length_mm"]
     sw = intr["sensor_width_mm"]; sh = intr["sensor_height_mm"]
@@ -658,9 +682,10 @@ def main():
     a.add_argument("--clf_conf", type=float, default=0.5,
                    help="min classifier confidence to keep a detection (else reject)")
     a.add_argument("--force_nadir", action="store_true",
-                   help="ignore camera orientation and use the nadir formula "
-                        "(only for debugging; default uses ray-cast which is "
-                        "correct for tilted/yawed cameras)")
+                   help="ignore the pose matrix's yaw and use the nadir formula "
+                        "directly (only for debugging; default uses ray-cast, "
+                        "which extracts yaw from the pose matrix but always "
+                        "assumes gimbal-locked nadir pitch and zero roll)")
     a.add_argument("--out", default="results.json")
     a.set_defaults(func=run_synthetic)
 

@@ -179,16 +179,48 @@ or a single detection above a confidence floor). This recovered a three-point
 tent cluster to 0.42 m in testing, without admitting isolated low-confidence
 false positives.
 
-### Two entry points
+### Entry points
 
 | Script | Use for | Pose source |
 |---|---|---|
-| `src/cluster_real_yaw.py` | **real flights** | EXIF GPS + `GPSImgDirection` heading + `--agl_m` |
+| `src/cluster_real_yaw.py` | **real flights, post-flight** (whole folder) | EXIF GPS + `GPSImgDirection` heading + `--agl_m` |
+| `src/streaming_localizer.py` | **live flights** (frame-at-a-time) | per-frame pose from autopilot telemetry, or EXIF via the folder watcher |
 | `src/cluster_pipeline.py synthetic` | pre-rendered synthetic flights | `flight_log.jsonl` camera poses; reports error against known ground truth |
 
-Both share the same stages 1–5; only the pose source differs. The synthetic mode
-is what produced the 3.80 / 3.94 m validation figures, since it has ground truth
-to measure against.
+All share the same stages 1–5; only the pose source and *when* clustering runs
+differ. The synthetic mode is what produced the 3.80 / 3.94 m validation figures,
+since it has ground truth to measure against.
+
+### Streaming mode
+
+`cluster_real_yaw.py` waits for the whole flight before it does anything. On the
+aircraft the images arrive one at a time, and stages **1 (detect)** and
+**3 (geolocate)** have no dependency on any other frame — only stage **4
+(cluster)** does. `src/streaming_localizer.py` runs 1–3 per frame as images
+land, accumulates the ground points, and runs 4–5 only on demand:
+
+```
+loc.add_frame(image, pose)   # detect + project — call in your receive loop
+...                          # repeat per image
+loc.estimate()               # cluster the points so far — a converging live fix
+loc.write_results("out.json")# final answer + viewer file
+```
+
+DBSCAN over a point set does not depend on arrival order, so the streamed final
+answer is identical to the batch script's. It differs only in two respects,
+both harmless:
+
+- **Local-frame origin** is the first usable frame's GPS, not the mean of all
+  frames (the mean needs the whole flight up front). Shifts the intermediate
+  metre coordinates only; emitted GPS is unchanged to sub-mm.
+- **Heading is required per frame** — from `pose["heading_deg"]` (autopilot
+  telemetry) or EXIF `GPSImgDirection` via the watcher. A frame without it is
+  logged and skipped for geolocation, never guessed. The batch script's
+  prev→next GPS-track estimate is not reproduced here.
+
+Run it as a **folder watcher** (images written into a directory by the ground
+station) — see *Quick start* — or drive it **frame by frame from your comms
+loop** — see *Integration*.
 
 ---
 
@@ -267,7 +299,7 @@ GPU optional (auto-detected, falls back to CPU).
 
 ## Quick start
 
-**1. Check the flight metadata is usable** — do this before anything else:
+**1. Check the flight metadata is usable** — before any new flight or camera:
 
 ```bash
 python src/inspect_dataset.py /path/to/flight_images
@@ -276,7 +308,11 @@ python src/inspect_dataset.py /path/to/flight_images
 Reports GPS, per-frame heading, altitude, intrinsics, and prints a verdict.
 If it says heading is missing, **stop** — see *Data requirements*.
 
-**2. Localize** (A8 mini at 150 ft):
+**2. Localize.** Same maths and same `results.json` either way; pick by *when*
+you have the images. `--agl_m` is height above **ground** in metres
+(150 ft = 45.7 m), not GPS sea-level altitude.
+
+*Post-flight* — you have the whole folder (A8 mini at 150 ft):
 
 ```bash
 python src/cluster_real_yaw.py \
@@ -288,10 +324,28 @@ python src/cluster_real_yaw.py \
     --out results.json
 ```
 
-`--agl_m` is height above **ground** in metres (150 ft = 45.7 m), not GPS
-sea-level altitude.
+*In flight* — detect + geolocate each image as it lands, cluster at the end.
+Point it at a directory the ground station drops images into:
 
-Output:
+```bash
+python src/streaming_localizer.py \
+    --images_dir /path/to/incoming \
+    --model models/yolo11m_best.pt \
+    --agl_m 45.7 --hfov_deg 80.2 \
+    --conf 0.15 --eps 4.0 --min_samples 2 \
+    --classifier models/mobilenet_finetuned.pth \
+    --out results.json --estimate_every 20
+```
+
+It picks up each new image once its size settles, prints a converging fix every
+`--estimate_every` frames, rewrites `--out` every `--checkpoint_every` frames
+(default 25) so a crash keeps a partial, and finalizes after `--idle_timeout` s
+with no new image (default 20; `<=0` runs until Ctrl-C). Heading is read from
+each image's EXIF `GPSImgDirection`; a frame without it is skipped with a
+warning. To feed frames straight from your comms loop instead of a folder, see
+*Integration*.
+
+Output (both):
 
 ```
   tent       local (  +12.2,  -18.4) m   GPS 12.9924125, 80.2360947   [14 pts]
@@ -341,6 +395,14 @@ across the flight path instead of converging.
 | `--rank` | `confsum` | **Leave this alone** — see below |
 | `--classifier` | optional | MobileNet gate. Works at matched pixel scale; rejects valid targets when they are far smaller than its training crops. At A8 ≤150 ft (87+ px) it is in range and worth enabling |
 
+`src/cluster_real_yaw.py` and `src/streaming_localizer.py` take all of the
+above identically. The streaming script adds watcher controls:
+`--estimate_every` (print a live fix every N frames), `--checkpoint_every`
+(rewrite `--out` every N frames, default 25), `--idle_timeout` (finalize after
+N idle seconds, default 20; `<=0` = until Ctrl-C), `--stable_sec` (wait for an
+image's size to stop changing before reading it), `--process_existing` (also
+process images already in the folder at startup).
+
 ### Why `--rank confsum` matters
 
 Clusters are ranked by **summed detection confidence**, not point count. On an
@@ -359,6 +421,8 @@ tested. `count` is retained only to reproduce that comparison.
 
 ## Integration
 
+### Post-flight, from Python
+
 ```python
 from src.cluster_real_yaw import run
 import argparse
@@ -372,6 +436,44 @@ args = argparse.Namespace(
 )
 run(args)
 ```
+
+### In flight, frame by frame
+
+Feed images straight from your receive loop — no watched folder. `add_frame`
+does detection + projection (cheap, per frame, independent of other frames);
+clustering + ranking are deferred to `estimate()` / `write_results()`.
+
+```python
+from src.streaming_localizer import StreamingLocalizer
+
+loc = StreamingLocalizer(
+    "models/yolo11m_best.pt", hfov_deg=80.2, agl_m=45.7,
+    classifier="models/mobilenet_finetuned.pth",
+    conf=0.15, eps=4.0, min_samples=2, rank="confsum",
+)
+
+for jpeg_bytes, tlm in link:                  # your comms loop
+    loc.add_frame(jpeg_bytes, {
+        "lat": tlm.lat, "lon": tlm.lon,
+        "agl_m": tlm.agl_m,                    # optional; else the ctor value
+        "heading_deg": tlm.yaw_deg_true,       # REQUIRED, deg CW from true north
+    })
+    if loc._frame_counter % 20 == 0:
+        print(loc.estimate())                 # converging live fix (optional)
+
+loc.write_results("results.json")             # final answer + viewer file
+```
+
+- `image` may be a path, `bytes`, a PIL image, or an `HxWx3` RGB ndarray.
+- `pose` must carry `lat`, `lon`, and `heading_deg`. A frame with
+  `heading_deg=None`, or `pose=None`, is logged and skipped for geolocation —
+  never projected with a guessed heading.
+- `estimate()` returns, per class, the current GPS plus `n_points` /
+  `n_clusters` / `score` so you can gate the drop on a fix that has converged.
+- Call `add_frame` from **one** thread; `estimate()` / `write_results()` may be
+  called from another at any time (they snapshot under a lock).
+
+### Reading results
 
 ```python
 import json
@@ -391,6 +493,7 @@ predicted_gps    {class: {lat, lon}}            absolute
 origin_latlon    [lat0, lon0]                   local frame origin
 clusters[class]  points, labels, centroids, scores, point_meta
 per_frame[]      image, gps, heading_deg, cam_xyz_m, detections[]
+                 cam_xyz_m = null -> frame skipped (no pose, or no heading)
 ```
 
 ---
@@ -417,15 +520,16 @@ per_frame[]      image, gps, heading_deg, cam_xyz_m, detections[]
 
 ```
 src/cluster_pipeline.py           clustering core, back-projection, classifier gate
-src/cluster_real_yaw.py           real-flight entry point (EXIF GPS + heading)  <- run this
+src/streaming_localizer.py        per-frame detect+project core; live entry point
+src/cluster_real_yaw.py           real-flight batch entry point (EXIF GPS + heading)  <- run this post-flight
 src/inspect_dataset.py            metadata validator — run before any new flight
 tools/viewer.html                 replay UI, loads results.json, no GPU needed
 tools/benchmark_quantization.py   quantized-variant comparison
 models/                           detector + verification classifier weights
 ```
 
-`cluster_real_yaw.py` imports from `cluster_pipeline.py` as a sibling — keep
-them in the same directory.
+`cluster_real_yaw.py` imports `streaming_localizer.py`, which imports
+`cluster_pipeline.py` — all three are siblings, keep them in the same directory.
 
 ---
 

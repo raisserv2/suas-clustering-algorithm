@@ -222,6 +222,51 @@ Run it as a **folder watcher** (images written into a directory by the ground
 station) — see *Quick start* — or drive it **frame by frame from your comms
 loop** — see *Integration*.
 
+### Dry-running it across two machines
+
+`tools/feed_flight.py` replays a folder as a drone would: it sends images one
+at a time, in filename order, with a fixed gap, to the incoming dir the watcher
+reads. SRC and DST may each be local or `user@host:/path` (over ssh + rsync).
+
+**Pose source for the test.** The watcher takes pose from an OpenDroneMap
+`geo.txt` (columns `image_name longitude latitude altitude_amsl_m yaw_deg
+pitch_deg roll_deg …`; `yaw_deg` is the heading, pitch/roll are ignored under
+the gimbal-nadir assumption) when one is present in `--images_dir` or its
+parent — otherwise it falls back to image EXIF. `feed_flight.py` ships a
+`geo.txt` found beside SRC before the first image, so the watcher has pose from
+frame 0. This is test-path only; the real-drone flow (`cluster_real_yaw.py`,
+and `StreamingLocalizer.add_frame` with telemetry pose) is unchanged.
+
+On the **pipeline machine** — start the watcher first, incoming dir empty:
+
+```bash
+mkdir -p ~/incoming && rm -f ~/incoming/*
+python src/streaming_localizer.py \
+    --images_dir ~/incoming \
+    --model models/yolo11m_best.pt \
+    --agl_m 45.7 --hfov_deg 80.2 \
+    --conf 0.15 --eps 4.0 --min_samples 2 \
+    --classifier models/mobilenet_finetuned.pth \
+    --out results.json --estimate_every 5 --idle_timeout 30
+```
+
+On the **machine holding the images** (needs only `tools/feed_flight.py` + ssh
+to the pipeline machine):
+
+```bash
+python tools/feed_flight.py \
+    /path/to/flight_images  user@<pipeline-host>:~/incoming  -i 2
+```
+
+The watcher prints `[geo] pose source: …`, then `[frame …] N dets` per image, a
+`[live]` fix every `--estimate_every`, a `[checkpoint]` every
+`--checkpoint_every`, then the final block and `results.json` once no new image
+has arrived for `--idle_timeout` s (keep that comfortably above the 2 s gap;
+raise it if the pipeline machine is CPU-only and a backlog builds). A frame
+with no `geo.txt` entry and no EXIF heading is logged and skipped. Same-machine
+test: use two terminals and a local `./incoming` path on both sides — point the
+feeder at the folder that has `geo.txt` in it.
+
 ---
 
 ## Camera: SIYI A8 mini
@@ -524,6 +569,7 @@ src/streaming_localizer.py        per-frame detect+project core; live entry poin
 src/cluster_real_yaw.py           real-flight batch entry point (EXIF GPS + heading)  <- run this post-flight
 src/inspect_dataset.py            metadata validator — run before any new flight
 tools/viewer.html                 replay UI, loads results.json, no GPU needed
+tools/feed_flight.py              replay an image folder as a 1-at-a-time drone stream (for testing streaming mode)
 tools/benchmark_quantization.py   quantized-variant comparison
 models/                           detector + verification classifier weights
 ```

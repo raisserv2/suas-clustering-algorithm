@@ -32,7 +32,9 @@ Two ways to drive it
                print(loc.estimate())               # converging live fix
        loc.write_results("results.json")
 
-2. Directory watcher (replay / testing) -- pose read from EXIF:
+2. Directory watcher (replay / testing) -- pose per image from an
+   OpenDroneMap geo.txt sidecar if present (auto-detected in --images_dir or
+   its parent, or pass --geo), otherwise from EXIF:
 
        python streaming_localizer.py \
            --images_dir incoming/ --model models/yolo11m_best.pt \
@@ -46,7 +48,7 @@ Differences vs cluster_real_yaw.py, by design
   every frame (the mean needs the whole flight up front). This only shifts
   the intermediate metre coordinates; the emitted GPS is unchanged to sub-mm.
 * Heading is taken per frame from the pose you pass in (autopilot telemetry,
-  or EXIF GPSImgDirection via the folder watcher). A frame with no heading is
+  geo.txt yaw_deg, or EXIF GPSImgDirection). A frame with no heading is
   recorded and skipped for geolocation, never guessed -- a wrong heading
   silently rotates that frame's detections onto the wrong ground point. The
   batch script's prev->next GPS-track estimate is not reproduced here.
@@ -76,7 +78,8 @@ EARTH_R = 6378137.0
 
 __all__ = [
     "StreamingLocalizer", "watch_directory", "print_final_report",
-    "discover_images", "read_exif_pose", "latlon_to_local_m",
+    "discover_images", "read_exif_pose", "read_geo_txt", "find_geo_txt",
+    "pose_from_geo_record", "resolve_pose", "latlon_to_local_m",
     "local_m_to_latlon", "bearing_from_gps", "focal_px_from_hfov",
     "backproject_yaw_nadir", "EARTH_R",
 ]
@@ -136,6 +139,109 @@ def read_exif_pose(image_path):
     except Exception as e:
         print(f"[exif] {os.path.basename(image_path)}: {e}", flush=True)
         return None
+
+
+# ----------------------------------------------------------------------------
+# geo.txt sidecar (OpenDroneMap format) -- pose lives in a text file next to
+# the images, not in EXIF:
+#
+#   EPSG:4326
+#   # image_name longitude latitude altitude_amsl_m yaw_deg pitch_deg roll_deg [h_acc v_acc]
+#   # yaw 0 = image top points north, pitch 0 = nadir  (ODM convention)
+#   SUAS-..._020.jpg 80.23650729 12.99246149 62.97 14.29 2.49 0.38 0.71 0.66
+#
+# yaw_deg is exactly our heading (deg CW from true north, image top along the
+# heading). pitch/roll are parsed but NOT used -- the pipeline assumes the
+# gimbal holds nadir; the small residuals here (~2.5 deg pitch) are within that
+# assumption. altitude is AMSL, so --agl_m is still supplied separately.
+# ----------------------------------------------------------------------------
+
+def read_geo_txt(path):
+    """Parse an OpenDroneMap geo.txt. Returns
+    {image_basename: {lat, lon, alt_amsl_m, heading_deg, pitch_deg, roll_deg}}.
+    Raises ValueError if a projection header other than EPSG:4326 / WGS84
+    lon-lat is declared (we can't reproject here)."""
+    with open(path) as fh:
+        lines = [ln.strip() for ln in fh if ln.strip()]
+    if not lines:
+        return {}
+
+    start = 0
+    head = lines[0].upper().replace(" ", "")
+    if head.startswith("EPSG:"):
+        if head.split(":", 1)[1] not in ("4326",):
+            raise ValueError(f"{path}: projection {lines[0]!r} unsupported "
+                             f"(need EPSG:4326 lon/lat)")
+        start = 1
+    elif head.startswith("WGS84") and "UTM" not in head:
+        start = 1
+    elif "UTM" in head or head.startswith("PROJ") or head.startswith("+PROJ"):
+        raise ValueError(f"{path}: projection {lines[0]!r} unsupported "
+                         f"(need EPSG:4326 lon/lat)")
+
+    poses = {}
+    for ln in lines[start:]:
+        if ln.startswith("#"):
+            continue
+        p = ln.split()
+        if len(p) < 4:
+            continue
+        try:
+            lon, lat, alt = float(p[1]), float(p[2]), float(p[3])
+        except ValueError:
+            continue
+
+        def _f(i):
+            try:
+                return float(p[i])
+            except (IndexError, ValueError):
+                return None
+
+        poses[os.path.basename(p[0])] = {
+            "lat": lat, "lon": lon, "alt_amsl_m": alt,
+            "heading_deg": _f(4), "pitch_deg": _f(5), "roll_deg": _f(6),
+        }
+    return poses
+
+
+def find_geo_txt(images_dir, explicit=None):
+    """Locate a geo.txt: the explicit path if given, else geo.txt in the image
+    folder or its parent. Returns a path or None."""
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    base = os.path.abspath(images_dir.rstrip("/") or ".")
+    for c in (os.path.join(base, "geo.txt"),
+              os.path.join(os.path.dirname(base), "geo.txt")):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def _image_size(path):
+    from PIL import Image
+    with Image.open(path) as im:
+        return im.size          # (W, H) -- from the header, no decode
+
+
+def pose_from_geo_record(g, image_path):
+    """A geo.txt record -> the pose dict shape read_exif_pose returns."""
+    W, H = _image_size(image_path)
+    return {"lat": g["lat"], "lon": g["lon"], "gps_alt_m": g.get("alt_amsl_m"),
+            "heading_deg": g.get("heading_deg"), "heading_ref": "T",
+            "heading_src": "geo.txt", "width": W, "height": H}
+
+
+def resolve_pose(image_path, geo_poses=None):
+    """Pose for one image: geo.txt if it has an entry for this file, else EXIF,
+    else None."""
+    if geo_poses:
+        g = geo_poses.get(os.path.basename(image_path))
+        if g is not None:
+            return pose_from_geo_record(g, image_path)
+    p = read_exif_pose(image_path)
+    if p is not None and p.get("heading_deg") is not None:
+        p.setdefault("heading_src", "exif")
+    return p
 
 
 def latlon_to_local_m(lat, lon, lat0, lon0):
@@ -521,23 +627,13 @@ def _print_estimate(est):
 # Directory-watch driver: process images as they land in a folder
 # ----------------------------------------------------------------------------
 
-def _pose_from_exif(path):
-    p = read_exif_pose(path)
-    if p is None:
-        return None
-    return {"lat": p["lat"], "lon": p["lon"],
-            "heading_deg": p["heading_deg"],
-            "heading_src": "exif" if p["heading_deg"] is not None else None,
-            "width": p["width"], "height": p["height"]}
-
-
-def watch_directory(loc, folder, *, poll_sec=1.0, stable_sec=0.4,
+def watch_directory(loc, folder, *, geo_poses=None, poll_sec=1.0, stable_sec=0.4,
                     idle_timeout=20.0, estimate_every=0, checkpoint_every=25,
                     out_path=None, _preseen=None):
     """Poll `folder`; for every new image whose size has stopped changing,
-    read its EXIF pose and hand it to loc.add_frame(). Returns the number of
-    frames fed. Stops after `idle_timeout` s with no new image (None = run
-    until KeyboardInterrupt)."""
+    resolve its pose (geo.txt entry if `geo_poses` has one, else EXIF) and hand
+    it to loc.add_frame(). Returns the number of frames fed. Stops after
+    `idle_timeout` s with no new image (None = run until KeyboardInterrupt)."""
     seen = set(_preseen or [])
     fidx = 0
     last_activity = time.time()
@@ -562,7 +658,7 @@ def watch_directory(loc, folder, *, poll_sec=1.0, stable_sec=0.4,
 
         for f in sorted(ready):
             seen.add(f)
-            pose = _pose_from_exif(f)
+            pose = resolve_pose(f, geo_poses)
             rec = loc.add_frame(f, pose, frame_index=fidx)
             fidx += 1
             last_activity = time.time()
@@ -605,6 +701,10 @@ def main():
                     default="confsum")
     ap.add_argument("--classifier", default=None)
     ap.add_argument("--clf_conf", type=float, default=0.5)
+    ap.add_argument("--geo", default=None,
+                    help="path to an OpenDroneMap geo.txt (pose per image). "
+                         "Default: auto-detect geo.txt in --images_dir or its "
+                         "parent. Falls back to EXIF for images not listed.")
     ap.add_argument("--out", default="results_stream.json")
     ap.add_argument("--poll_sec", type=float, default=1.0)
     ap.add_argument("--stable_sec", type=float, default=0.4,
@@ -633,6 +733,18 @@ def main():
           f"eps={args.eps} min_samples={args.min_samples} rank={args.rank}  "
           f"classifier={'on' if args.classifier else 'off'}", flush=True)
 
+    geo_poses = None
+    geo_path = find_geo_txt(args.images_dir, args.geo)
+    if geo_path:
+        geo_poses = read_geo_txt(geo_path)
+        print(f"[geo] pose source: {geo_path}  ({len(geo_poses)} images; "
+              f"yaw=heading, pitch/roll ignored -- gimbal-nadir assumed)",
+              flush=True)
+    elif args.geo:
+        sys.exit(f"[fatal] --geo {args.geo} not found")
+    else:
+        print("[geo] no geo.txt found -- reading pose from image EXIF", flush=True)
+
     preseen = set()
     if not args.process_existing:
         preseen = set(discover_images(args.images_dir))
@@ -642,7 +754,7 @@ def main():
 
     try:
         watch_directory(
-            loc, args.images_dir,
+            loc, args.images_dir, geo_poses=geo_poses,
             poll_sec=args.poll_sec, stable_sec=args.stable_sec,
             idle_timeout=(None if args.idle_timeout <= 0 else args.idle_timeout),
             estimate_every=args.estimate_every,

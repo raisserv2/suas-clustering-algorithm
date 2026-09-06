@@ -222,6 +222,42 @@ Run it as a **folder watcher** (images written into a directory by the ground
 station) — see *Quick start* — or drive it **frame by frame from your comms
 loop** — see *Integration*.
 
+### Dry-running it across two machines
+
+`tools/feed_flight.py` replays a folder as a drone would: it sends images one
+at a time, in filename order, with a fixed gap, to the incoming dir the watcher
+reads. SRC and DST may each be local or `user@host:/path` (over ssh + rsync).
+
+On the **pipeline machine** — start the watcher first, incoming dir empty:
+
+```bash
+mkdir -p ~/incoming && rm -f ~/incoming/*
+python src/streaming_localizer.py \
+    --images_dir ~/incoming \
+    --model models/yolo11m_best.pt \
+    --agl_m 45.7 --hfov_deg 80.2 \
+    --conf 0.15 --eps 4.0 --min_samples 2 \
+    --classifier models/mobilenet_finetuned.pth \
+    --out results.json --estimate_every 5 --idle_timeout 30
+```
+
+On the **machine holding the images** (needs only `tools/feed_flight.py` + ssh
+to the pipeline machine):
+
+```bash
+python tools/feed_flight.py \
+    /path/to/flight_images  user@<pipeline-host>:~/incoming  -i 2
+```
+
+The watcher prints `[frame …] N dets` per image, a `[live]` fix every
+`--estimate_every`, a `[checkpoint]` every `--checkpoint_every`, then the final
+block and `results.json` once no new image has arrived for `--idle_timeout` s
+(keep that comfortably above the 2 s gap; raise it if the pipeline machine is
+CPU-only and a backlog builds). First confirm the images carry GPS + heading
+with `python src/inspect_dataset.py /path/to/flight_images` — without EXIF
+`GPSImgDirection` every frame is skipped. Same-machine test: use two terminals
+and a local `./incoming` path on both sides.
+
 ---
 
 ## Camera: SIYI A8 mini
@@ -524,6 +560,7 @@ src/streaming_localizer.py        per-frame detect+project core; live entry poin
 src/cluster_real_yaw.py           real-flight batch entry point (EXIF GPS + heading)  <- run this post-flight
 src/inspect_dataset.py            metadata validator — run before any new flight
 tools/viewer.html                 replay UI, loads results.json, no GPU needed
+tools/feed_flight.py              replay an image folder as a 1-at-a-time drone stream (for testing streaming mode)
 tools/benchmark_quantization.py   quantized-variant comparison
 models/                           detector + verification classifier weights
 ```

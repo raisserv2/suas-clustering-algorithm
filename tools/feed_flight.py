@@ -24,6 +24,10 @@ Each image is delivered with rsync, which copies to a hidden temp name and
 atomically renames it into place, so the watcher never sees a half-written
 file (its --stable_sec check is a second guard).
 
+If an OpenDroneMap geo.txt (pose per image) sits beside SRC or in its parent,
+it is sent once before the first image so the watcher has pose from frame 0.
+Override its location with --geo, disable with --no-geo.
+
 ORDER OF OPERATIONS
     1. Start src/streaming_localizer.py on the DST side first, pointed at the
        incoming dir while it is still EMPTY (it ignores images already there
@@ -79,6 +83,21 @@ def list_images(src):
     return sorted(files)
 
 
+def join_path(base, name):
+    """base + name, keeping the local-or-remote form of base."""
+    if is_remote(base):
+        host, path = base.split(":", 1)
+        return f"{host}:{posixpath.join(path, name)}"
+    return os.path.join(base, name)
+
+
+def parent_path(p):
+    if is_remote(p):
+        host, path = p.split(":", 1)
+        return f"{host}:{posixpath.dirname(path.rstrip('/'))}"
+    return os.path.dirname(os.path.abspath(p.rstrip("/")))
+
+
 def base_name(p):
     if is_remote(p):
         p = p.split(":", 1)[1]
@@ -97,6 +116,11 @@ def main():
                     help="send at most N images (0 = all)")
     ap.add_argument("--start-delay", type=float, default=0.0,
                     help="wait this long before the first image")
+    ap.add_argument("--geo", default=None,
+                    help="path to a geo.txt to deliver once before the images "
+                         "(default: geo.txt beside SRC, or in its parent)")
+    ap.add_argument("--no-geo", action="store_true",
+                    help="do not send any geo.txt")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the send order and exit")
     args = ap.parse_args()
@@ -117,6 +141,26 @@ def main():
     dst = args.dst.rstrip("/") + "/"
     if not is_remote(args.dst):
         os.makedirs(args.dst, exist_ok=True)
+
+    # deliver geo.txt first so the watcher has pose from frame 0
+    if not args.no_geo:
+        geo = args.geo
+        if geo is None:
+            for cand in (join_path(args.src, "geo.txt"),
+                         join_path(parent_path(args.src), "geo.txt")):
+                if is_remote(cand):
+                    geo = cand          # can't stat remote; let rsync try
+                    break
+                if os.path.isfile(cand):
+                    geo = cand
+                    break
+        if geo:
+            rc = subprocess.run(["rsync", "-q", geo, dst]).returncode
+            print(f"[feed] geo.txt {'-> ' + args.dst if rc == 0 else f'skipped (rsync rc={rc})'}",
+                  flush=True)
+        else:
+            print("[feed] no geo.txt found beside SRC -- watcher will use EXIF",
+                  flush=True)
 
     if args.start_delay:
         time.sleep(args.start_delay)

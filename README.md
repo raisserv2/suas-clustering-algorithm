@@ -228,6 +228,15 @@ loop** — see *Integration*.
 at a time, in filename order, with a fixed gap, to the incoming dir the watcher
 reads. SRC and DST may each be local or `user@host:/path` (over ssh + rsync).
 
+**Pose source for the test.** The watcher takes pose from an OpenDroneMap
+`geo.txt` (columns `image_name longitude latitude altitude_amsl_m yaw_deg
+pitch_deg roll_deg …`; `yaw_deg` is the heading, pitch/roll are ignored under
+the gimbal-nadir assumption) when one is present in `--images_dir` or its
+parent — otherwise it falls back to image EXIF. `feed_flight.py` ships a
+`geo.txt` found beside SRC before the first image, so the watcher has pose from
+frame 0. This is test-path only; the real-drone flow (`cluster_real_yaw.py`,
+and `StreamingLocalizer.add_frame` with telemetry pose) is unchanged.
+
 On the **pipeline machine** — start the watcher first, incoming dir empty:
 
 ```bash
@@ -249,14 +258,14 @@ python tools/feed_flight.py \
     /path/to/flight_images  user@<pipeline-host>:~/incoming  -i 2
 ```
 
-The watcher prints `[frame …] N dets` per image, a `[live]` fix every
-`--estimate_every`, a `[checkpoint]` every `--checkpoint_every`, then the final
-block and `results.json` once no new image has arrived for `--idle_timeout` s
-(keep that comfortably above the 2 s gap; raise it if the pipeline machine is
-CPU-only and a backlog builds). First confirm the images carry GPS + heading
-with `python src/inspect_dataset.py /path/to/flight_images` — without EXIF
-`GPSImgDirection` every frame is skipped. Same-machine test: use two terminals
-and a local `./incoming` path on both sides.
+The watcher prints `[geo] pose source: …`, then `[frame …] N dets` per image, a
+`[live]` fix every `--estimate_every`, a `[checkpoint]` every
+`--checkpoint_every`, then the final block and `results.json` once no new image
+has arrived for `--idle_timeout` s (keep that comfortably above the 2 s gap;
+raise it if the pipeline machine is CPU-only and a backlog builds). A frame
+with no `geo.txt` entry and no EXIF heading is logged and skipped. Same-machine
+test: use two terminals and a local `./incoming` path on both sides — point the
+feeder at the folder that has `geo.txt` in it.
 
 ---
 
